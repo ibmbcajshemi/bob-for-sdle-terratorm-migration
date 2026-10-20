@@ -18,12 +18,14 @@ WS=""
 HOSTNAME_TFE="app.terraform.io"
 TF_VERSION="1.14.3"
 
+VAR_FILES=()
+
 usage() {
   cat >&2 <<EOF
 Usage: cloud-deploy-tfe.sh --action <provision|plan|apply> --org <tfe-org> --workspace <tfe-ws> [options]
 
 Actions:
-  provision          Create workspace in TFE
+  provision          Create workspace in TFE & upload configured variables
   plan               Upload config & trigger speculative plan in TFE
   apply              Upload config, trigger remote plan & apply in TFE
 
@@ -34,6 +36,7 @@ Required:
 
 Options:
   --dir <path>       Terraform source directory (default: ibmcloud-infra2.0 or current dir)
+  --var-file <file>  .tfvars file to parse & upload during provisioning (repeatable)
   --hostname <host>  TFE hostname (default: app.terraform.io)
   --tf-version <ver> Terraform version (default: 1.14.3)
   -h, --help         Show help
@@ -49,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --dir)        DIR="${2:?}"; shift 2 ;;
     --org)        ORG="${2:?}"; shift 2 ;;
     --workspace)  WS="${2:?}"; shift 2 ;;
+    --var-file)   VAR_FILES+=("${2:?}"); shift 2 ;;
     --hostname)   HOSTNAME_TFE="${2:?}"; shift 2 ;;
     --tf-version) TF_VERSION="${2:?}"; shift 2 ;;
     -h|--help)    usage; exit 0 ;;
@@ -69,36 +73,126 @@ get_ws_id() {
     "$TFE_API/organizations/$ORG/workspaces/$WS" | jq -r '.data.id // empty'
 }
 
+# Helper: Upload / synchronize variables to TFE with automated category detection
+sync_variables() {
+  local ws_id="$1"
+  local env_secret_re='(password|secret|token|api_key|private_key|credential|cert|client_secret|access_key)|(^|_)pat($|_)|^IC_|^IBMCLOUD_|^AWS_|^TF_VAR_'
+
+  # 1. Upload variables from specified .tfvars files
+  for vf in "${VAR_FILES[@]+"${VAR_FILES[@]}"}"; do
+    local f="$vf"
+    [[ "$f" = /* ]] || f="$DIR/$f"
+    [[ -f "$f" ]] || { log "Notice: var-file $f not found, skipping"; continue; }
+    log "Parsing and uploading variables from $f..."
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+      local key="${BASH_REMATCH[1]}"
+      local val="${BASH_REMATCH[2]}"
+      local hcl=false
+      local category="terraform"
+      local sensitive=false
+
+      if [[ "$val" == \"* ]]; then
+        val="${val#\"}"; val="${val%%\"*}"
+      else
+        val="${val%%#*}"; val="$(echo "$val" | sed -e 's/[[:space:]]*$//')"
+        if [[ "$val" =~ ^(true|false|[0-9.]+)$ ]]; then
+          hcl=true
+        elif [[ "$val" == \[* || "$val" == \{* ]]; then
+          hcl=true
+        fi
+      fi
+
+      # Detect category and sensitivity
+      if [[ "$key" =~ ^(TF_VAR_|IC_|IBMCLOUD_|AWS_) ]]; then
+        category="env"
+      fi
+      if [[ "$key" =~ $env_secret_re ]]; then
+        sensitive=true
+      fi
+
+      curl -s --request POST \
+        --header "Authorization: Bearer $TFE_TOKEN" \
+        --header "Content-Type: application/vnd.api+json" \
+        --data "{
+          \"data\": {
+            \"type\": \"vars\",
+            \"attributes\": {
+              \"key\": \"$key\",
+              \"value\": \"$val\",
+              \"category\": \"$category\",
+              \"hcl\": $hcl,
+              \"sensitive\": $sensitive
+            }
+          }
+        }" \
+        "$TFE_API/workspaces/$ws_id/vars" >/dev/null || true
+      log "  - Uploaded $category var: $key (sensitive: $sensitive)"
+    done < "$f"
+  done
+
+  # 2. Check and upload SSH Public Key if found locally and declared in variables.tf
+  if grep -q 'variable "ssh_public_key"' "$DIR"/*.tf 2>/dev/null; then
+    local ssh_key=""
+    for k in ~/.ssh/id_rsa.pub ~/.ssh/id_ed25519.pub ~/.ssh/*.pub; do
+      if [[ -f "$k" ]]; then ssh_key="$(cat "$k")"; break; fi
+    done
+    if [[ -n "$ssh_key" ]]; then
+      curl -s --request POST \
+        --header "Authorization: Bearer $TFE_TOKEN" \
+        --header "Content-Type: application/vnd.api+json" \
+        --data "{
+          \"data\": {
+            \"type\": \"vars\",
+            \"attributes\": {
+              \"key\": \"ssh_public_key\",
+              \"value\": \"$ssh_key\",
+              \"category\": \"terraform\",
+              \"hcl\": false,
+              \"sensitive\": false
+            }
+          }
+        }" \
+        "$TFE_API/workspaces/$ws_id/vars" >/dev/null || true
+      log "  - Uploaded terraform var: ssh_public_key"
+    fi
+  fi
+}
+
 action_provision() {
   log "Checking if workspace '$WS' exists in org '$ORG'..."
   local ws_id
   ws_id="$(get_ws_id)"
   if [[ -n "$ws_id" ]]; then
     log "Workspace already exists: $ws_id"
-    return 0
+  else
+    log "Creating workspace '$WS' (mode: remote, terraform: $TF_VERSION)..."
+    local resp
+    resp=$(curl -s --request POST \
+      --header "Authorization: Bearer $TFE_TOKEN" \
+      --header "Content-Type: application/vnd.api+json" \
+      --data "{
+        \"data\": {
+          \"type\": \"workspaces\",
+          \"attributes\": {
+            \"name\": \"$WS\",
+            \"execution-mode\": \"remote\",
+            \"terraform-version\": \"$TF_VERSION\",
+            \"auto-apply\": false
+          }
+        }
+      }" \
+      "$TFE_API/organizations/$ORG/workspaces")
+
+    ws_id=$(echo "$resp" | jq -r '.data.id // empty')
+    [[ -n "$ws_id" ]] || { echo "$resp" >&2; die "Failed to create workspace"; }
+    log "Workspace created successfully: $ws_id"
   fi
 
-  log "Creating workspace '$WS' (mode: remote, terraform: $TF_VERSION)..."
-  local resp
-  resp=$(curl -s --request POST \
-    --header "Authorization: Bearer $TFE_TOKEN" \
-    --header "Content-Type: application/vnd.api+json" \
-    --data "{
-      \"data\": {
-        \"type\": \"workspaces\",
-        \"attributes\": {
-          \"name\": \"$WS\",
-          \"execution-mode\": \"remote\",
-          \"terraform-version\": \"$TF_VERSION\",
-          \"auto-apply\": false
-        }
-      }
-    }" \
-    "$TFE_API/organizations/$ORG/workspaces")
-
-  ws_id=$(echo "$resp" | jq -r '.data.id // empty')
-  [[ -n "$ws_id" ]] || { echo "$resp" >&2; die "Failed to create workspace"; }
-  log "Workspace created successfully: $ws_id"
+  # Auto-sync variables if provided
+  if [[ ${#VAR_FILES[@]} -gt 0 || -d "$DIR" ]]; then
+    sync_variables "$ws_id"
+  fi
 }
 
 # Helper: Package and upload Terraform configuration to TFE

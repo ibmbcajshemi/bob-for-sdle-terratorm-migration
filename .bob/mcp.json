@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "terraform": {
-      "command": "/Users/akpojotorshemi/projectbob/CLIENT_PROJECTS/bob-for-sdle-terratorm-migration/.bob/scripts/run-terraform-mcp.sh",
+      "command": ".bob/scripts/run-terraform-mcp.sh",
       "args": [],
       "disabled": false,
       "timeout": 30000

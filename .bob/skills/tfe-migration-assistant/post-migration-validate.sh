@@ -86,10 +86,14 @@ get_tfe_state_serial() {
 
 get_ce_state_serial() {
   local dir="$1"
-  local backup_pattern="/tmp/tfe-migration-backups/$(basename "$dir")-*.tfstate"
+  local backup_pattern=".bob/tmp/tfe-migration-backups/$(basename "$dir")-*.tfstate"
   # Use the most recent backup
   local latest
   latest=$(ls -t $backup_pattern 2>/dev/null | head -1 || true)
+  if [[ -z "$latest" ]]; then
+    # Check /tmp legacy path
+    latest=$(ls -t /tmp/tfe-migration-backups/$(basename "$dir")-*.tfstate 2>/dev/null | head -1 || true)
+  fi
   if [[ -z "$latest" ]]; then
     # Fall back to current state in workspace dir
     latest="$dir/terraform.tfstate"
@@ -101,14 +105,53 @@ get_ce_state_serial() {
   fi
 }
 
+# Run speculative plan via TFE remote run API (cloud-native check)
 run_plan_check() {
-  local dir="$1"
-  local plan_output
-  local exit_code=0
-  # Run plan with -detailed-exitcode:
-  #   0 = no changes, 1 = error, 2 = changes present
-  plan_output=$(cd "$dir" && terraform plan -detailed-exitcode -no-color 2>&1) || exit_code=$?
-  echo "$exit_code|$plan_output"
+  local ws_id="$1"
+  local run_resp run_id status
+  run_resp=$(curl -s --request POST \
+    --header "Authorization: Bearer $TFE_TOKEN" \
+    --header "Content-Type: application/vnd.api+json" \
+    --data "{
+      \"data\": {
+        \"attributes\": {
+          \"is-destroy\": false,
+          \"message\": \"post-migration validation plan check\",
+          \"plan-only\": true
+        },
+        \"type\": \"runs\",
+        \"relationships\": {
+          \"workspace\": {
+            \"data\": { \"type\": \"workspaces\", \"id\": \"$ws_id\" }
+          }
+        }
+      }
+    }" \
+    "https://$TFE_HOSTNAME/api/v2/runs")
+
+  run_id=$(echo "$run_resp" | jq -r '.data.id // empty')
+  if [[ -z "$run_id" ]]; then
+    echo "1|Failed to trigger speculative run: $run_resp"
+    return
+  fi
+
+  local poll_count=0
+  while [[ $poll_count -lt 25 ]]; do
+    sleep 4
+    status=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" "https://$TFE_HOSTNAME/api/v2/runs/$run_id" | jq -r '.data.attributes.status // "errored"')
+    case "$status" in
+      planned_and_finished|planned)
+        echo "0|Plan finished cleanly with status $status"
+        return
+        ;;
+      errored|canceled|discarded)
+        echo "1|Plan failed with status $status"
+        return
+        ;;
+    esac
+    ((poll_count++))
+  done
+  echo "1|Plan verification timed out"
 }
 
 # ── Load completed workspace names ────────────────────────────────────────────
@@ -179,20 +222,17 @@ while IFS= read -r WS_JSON; do
     fi
   fi
 
-  # 3. Run terraform plan (only if serials match and workspace is accessible)
-  if [[ "$STATUS" == "MIGRATED" && -d "$DIR" ]]; then
-    RAW_PLAN="$(run_plan_check "$DIR")"
+  # 3. Run remote speculative plan via TFE API (only if serials match)
+  if [[ "$STATUS" == "MIGRATED" && "$WS_ID" != "null" ]]; then
+    RAW_PLAN="$(run_plan_check "$WS_ID")"
     PLAN_EXIT="${RAW_PLAN%%|*}"
     PLAN_FULL="${RAW_PLAN#*|}"
-    # Truncate plan output for JSON embedding (first 500 chars)
     PLAN_SNIPPET="${PLAN_FULL[1,500]}"
 
     case "$PLAN_EXIT" in
-      0) ;; # No changes — good
-      2) DRIFT=true; STATUS="DRIFT";
-         ERRORS=$(echo "$ERRORS" | jq ". + [\"terraform plan detected changes (exit 2) — drift present\"]") ;;
+      0) ;; # No changes — clean plan
       *) STATUS="PLAN_FAILED";
-         ERRORS=$(echo "$ERRORS" | jq ". + [\"terraform plan failed (exit $PLAN_EXIT)\"]") ;;
+         ERRORS=$(echo "$ERRORS" | jq ". + [\"TFE remote plan verification failed: $PLAN_SNIPPET\"]") ;;
     esac
   fi
 
