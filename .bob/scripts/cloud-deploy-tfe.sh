@@ -131,6 +131,29 @@ sync_variables() {
     done < "$f"
   done
 
+  # 1b. Check if IBM Cloud API key is in local environment and upload as TF_VAR / Env var
+  local ibm_key="${IBMCLOUD_API_KEY:-${TF_VAR_ibmcloud_api_key:-${IC_API_KEY:-}}}"
+  if [[ -n "$ibm_key" ]]; then
+    curl -s --request POST \
+      --header "Authorization: Bearer $TFE_TOKEN" \
+      --header "Content-Type: application/vnd.api+json" \
+      --data "{
+        \"data\": {
+          \"type\": \"vars\",
+          \"attributes\": {
+            \"key\": \"ibmcloud_api_key\",
+            \"value\": \"$ibm_key\",
+            \"category\": \"terraform\",
+            \"hcl\": false,
+            \"sensitive\": true
+          }
+        }
+      }" \
+      "$TFE_API/workspaces/$ws_id/vars" >/dev/null || true
+    log "  - Uploaded terraform secret var: ibmcloud_api_key (sensitive: true)"
+  fi
+
+
   # 2. Check and upload SSH Public Key if found locally and declared in variables.tf
   if grep -q 'variable "ssh_public_key"' "$DIR"/*.tf 2>/dev/null; then
     local ssh_key=""
