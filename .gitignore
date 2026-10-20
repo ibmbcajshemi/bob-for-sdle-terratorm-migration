@@ -1,0 +1,23 @@
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Bob temporary working files & state backups
+.bob/tmp/
+backups/
+
+# Secrets & Environment variables
+.env
+*.local
+*.tfvars
+*.tfvars.json
+
+# Terraform runtime & state files
+.terraform/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.plan
+*.lock.hcl
