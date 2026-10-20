@@ -26,6 +26,7 @@ resource "ibm_resource_instance" "cos_instance" {
     "environment:${var.environment}",
     "managed-by:terraform",
     "project:${var.project_name}",
+    "audit:gitops-verified",
   ]
 }
 
